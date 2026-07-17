@@ -1818,6 +1818,20 @@ void loop()
           }
           else
           {
+            // NLOS diagnostics: compare first-path power to total received power.
+            // In LOS, the two are close; a large gap indicates the direct path
+            // was attenuated relative to multipath, suggesting NLOS.
+            double sig_strength = DWM3000.getSignalStrength();
+            double fp_strength = DWM3000.getFirstPathSignalStrength();
+            double nlos_diff = sig_strength - fp_strength;
+            Serial.print("[NLOS] Signal: ");
+            Serial.print(sig_strength);
+            Serial.print(" dBm | First Path: ");
+            Serial.print(fp_strength);
+            Serial.print(" dBm | Diff: ");
+            Serial.print(nlos_diff);
+            Serial.println(" dB");
+
             enterStage(1);
           }
         }
