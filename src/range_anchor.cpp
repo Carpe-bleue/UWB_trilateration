@@ -5,8 +5,11 @@
 #define CHIP_SELECT_PIN 4
 
 // Set to 1 for Anchor 1, 2 for Anchor 2
-#define ANCHOR_ID 3
-#define RESPONSE_TIMEOUT_MS 500 // Maximum time to wait for a response
+#define ANCHOR_ID 1
+#define RESPONSE_TIMEOUT_MS 300 // Maximum time to wait for a response
+
+static unsigned long stage_entered_at = 0;
+
 unsigned long last_ranging_time = 0;
 #define MAX_RETRIES 3
 int retry_count = 0;
@@ -16,11 +19,17 @@ static int tx_status;
 
 static int curr_stage = 0;
 
+inline void enterStage(int new_stage) {
+  curr_stage = new_stage;
+  stage_entered_at = millis();
+}
+
 static int t_roundB = 0;
 static int t_replyB = 0;
 
 static long long rx = 0;
 static long long tx = 0;
+
 
 #define LEN_RX_CAL_CONF 4
 #define LEN_TX_FCTRL_CONF 6
@@ -115,7 +124,7 @@ static long long tx = 0;
 #define NO_OFFSET 0x0
 
 #define DEBUG_OUTPUT 0 // Turn to 1 to get all reads, writes, etc. as info in the console
-static int ANTENNA_DELAY = 16340;
+static int ANTENNA_DELAY = 16360;
 
 int led_status = 0;
 
@@ -200,6 +209,7 @@ public:
   static void standardTX();
   static void standardRX();
   static void TXInstantRX();
+  static void trxoff();
 
   // DWM3000 Firmware Interaction
   static void softReset();
@@ -585,7 +595,10 @@ void DWM3000Class::ds_sendFrame(int stage)
   write(0x14, 0x03, stage & 0x7);
   setFrameLength(4);
 
-  TXInstantRX(); // Await response
+  trxoff();
+  delayMicroseconds(20);
+  clearSystemStatus();
+  TXInstantRX();
 
   bool error = true;
   for (int i = 0; i < 50; i++)
@@ -618,6 +631,9 @@ void DWM3000Class::ds_sendRTInfo(int t_roundB, int t_replyB)
 
   setFrameLength(12);
 
+  trxoff();
+  delayMicroseconds(20);
+  clearSystemStatus();
   TXInstantRX();
 }
 
@@ -1245,6 +1261,10 @@ void DWM3000Class::TXInstantRX()
 {
   DWM3000Class::writeFastCommand(0x0C);
 }
+void DWM3000Class::trxoff()
+{
+  DWM3000Class::writeFastCommand(0x00);
+}
 
 /*
  #####  DWM3000 Firmware Interaction  #####
@@ -1693,11 +1713,16 @@ int DWM3000Class::checkForDevID()
 void resetRadio()
 {
   Serial.println("[INFO] Performing radio reset...");
-  DWM3000.softReset();
-  delay(100);
-  DWM3000.clearSystemStatus();
+  DWM3000.hardReset();  // physical RST pin reset — clears chip state fully
+  delay(200);
+  DWM3000.init();       // full re-init restores PLL, PGF calibration, channel config
+  DWM3000.setupGPIO();
+  DWM3000.setTXAntennaDelay(ANTENNA_DELAY);
+  DWM3000.setSenderID(ANCHOR_ID);
   DWM3000.configureAsTX();
+  DWM3000.clearSystemStatus();
   DWM3000.standardRX();
+  Serial.println("[INFO] Radio reset complete.");
 }
 
 void setup()
@@ -1749,6 +1774,7 @@ void setup()
   DWM3000.configureAsTX();
   DWM3000.clearSystemStatus();
   DWM3000.standardRX();
+  stage_entered_at = millis();
 }
 
 void loop()
@@ -1759,7 +1785,7 @@ void loop()
     if (curr_stage != 0)
     {
       Serial.println("[INFO] New request - resetting session");
-      curr_stage = 0;
+      enterStage(0);
       t_roundB = 0;
       t_replyB = 0;
     }
@@ -1769,20 +1795,18 @@ void loop()
   case 0: // Await ranging
     t_roundB = 0;
     t_replyB = 0;
-    last_ranging_time = millis(); // Reset timeout timer
 
-    if (rx_status = DWM3000.receivedFrameSucc())  // Check Poll Received
+    if (rx_status = DWM3000.receivedFrameSucc())
     {
       DWM3000.clearSystemStatus();
       if (rx_status == 1)
-      { // If frame reception was successful
-        // Only respond if frame is addressed to us
+      {
         if (DWM3000.getDestinationID() == ANCHOR_ID)
         {
           if (DWM3000.ds_isErrorFrame())
           {
             Serial.println("[WARNING] Received error frame!");
-            curr_stage = 0;
+            enterStage(0);
             DWM3000.standardRX();
           }
           else if (DWM3000.ds_getStage() != 1)
@@ -1790,43 +1814,37 @@ void loop()
             Serial.print("[WARNING] Unexpected stage: ");
             Serial.println(DWM3000.ds_getStage());
             DWM3000.ds_sendErrorFrame();
-            DWM3000.standardRX();
-            curr_stage = 0;
+            enterStage(0);
           }
           else
           {
-            curr_stage = 1; // Move to send response
+            enterStage(1);
           }
         }
         else
         {
-          // Not for us, go back to RX
           DWM3000.standardRX();
         }
       }
-      else
-      {
-        Serial.println("[ERROR] Receiver Error occurred!");
-        DWM3000.clearSystemStatus();
-      }
     }
-    else if (millis() - last_ranging_time > RESPONSE_TIMEOUT_MS)
+    else if (millis() - stage_entered_at > RESPONSE_TIMEOUT_MS)
     {
-      Serial.println("[WARNING] Timeout waiting for ranging request");
+      Serial.println("[WARNING] Timeout waiting for poll");
+      stage_entered_at = millis(); // restart the idle timer for next wait period
       if (++retry_count > MAX_RETRIES)
       {
-        Serial.println("[ERROR] Max retries reached, resetting radio");
+        Serial.println("[ERROR] Max retries reached → Resetting radio");
         resetRadio();
         retry_count = 0;
       }
-      DWM3000.standardRX(); // Reset to listening mode
+      DWM3000.trxoff();
+      delayMicroseconds(20);
+      DWM3000.clearSystemStatus();
+      DWM3000.standardRX();
     }
-    break;
+    break; // Await ranging   t_roundB = 0;   t_replyB = 0;   last_ranging_time = millis(); // Reset timeout time   if (rx_status = DWM3000.receivedFrameSucc())  // Check Poll Received   {     DWM3000.clearSystemStatus();     if (rx_status == 1)     { // If frame reception was successful       // Only respond if frame is addressed to us       if (DWM3000.getDestinationID() == ANCHOR_ID)       {         if (DWM3000.ds_isErrorFrame())         {           Serial.println("[WARNING] Received error frame!");           enterStage(0);           DWM3000.standardRX();         }         else if (DWM3000.ds_getStage() != 1)         {           Serial.print("[WARNING] Unexpected stage: ");           Serial.println(DWM3000.ds_getStage());           DWM3000.ds_sendErrorFrame();           DWM3000.standardRX();           enterStage(0);         }         else         {           enterStage(1); // Move to send response         }       }       else       {         // Not for us, go back to RX         DWM3000.standardRX();       }     }     else     {       Serial.println("[ERROR] Receiver Error occurred!");       DWM3000.clearSystemStatus();     }   }   else if (millis() - last_ranging_time > RESPONSE_TIMEOUT_MS)   {     Serial.println("[WARNING] Timeout waiting for ranging request");     if (++retry_count > MAX_RETRIES)     {       Serial.println("[ERROR] Max retries reached, resetting radio");       resetRadio();       retry_count = 0;     }     DWM3000.standardRX(); // Reset to listening mode   }   break;
 
   case 1: // Ranging received. Sending response
-    Serial.print("[ANCHOR DEBUG] Received Poll from Tag → Sending Response (stage 2) to ID ");
-    Serial.println(DWM3000.getSenderID());
-
     DWM3000.setDestinationID(DWM3000.getSenderID());
     DWM3000.ds_sendFrame(2);
 
@@ -1834,15 +1852,12 @@ void loop()
     tx = DWM3000.readTXTimestamp();
     t_replyB = tx - rx;
 
-    Serial.print("   → TX timestamp: ");
-    Serial.println(tx);
-
-    curr_stage = 2;
+    enterStage(2);
     last_ranging_time = millis();
     break;
 
-  case 2: // Awaiting response
-    if (rx_status = DWM3000.receivedFrameSucc())  // Check Final Received
+  case 2:                                        // Awaiting response
+    if (rx_status = DWM3000.receivedFrameSucc()) // Check Final Received
     {
       retry_count = 0; // Reset on successful response
       DWM3000.clearSystemStatus();
@@ -1856,7 +1871,7 @@ void loop()
         else if (DWM3000.ds_isErrorFrame())
         {
           Serial.println("[WARNING] Received error frame!");
-          curr_stage = 0;
+          enterStage(0);
           DWM3000.standardRX();
         }
         else if (DWM3000.ds_getStage() != 3)
@@ -1865,17 +1880,20 @@ void loop()
           Serial.println(DWM3000.ds_getStage());
           DWM3000.ds_sendErrorFrame();
           DWM3000.standardRX();
-          curr_stage = 0;
+          enterStage(0);
         }
         else
         {
-          curr_stage = 3; // Move to calculate and report
+          enterStage(3); // Move to calculate and report
         }
       }
       else
       {
         Serial.println("[ERROR] Receiver Error occurred!");
+        DWM3000.trxoff();
+        delayMicroseconds(20);
         DWM3000.clearSystemStatus();
+        DWM3000.standardRX();
       }
     }
     else if (millis() - last_ranging_time > RESPONSE_TIMEOUT_MS)
@@ -1887,17 +1905,20 @@ void loop()
         resetRadio();
         retry_count = 0;
       }
-      curr_stage = 0;
+      enterStage(0);
+      DWM3000.trxoff();
+      delayMicroseconds(20);
+      DWM3000.clearSystemStatus();
       DWM3000.standardRX();
     }
     break;
 
-  case 3: // Second response received. Sending information frame
-    rx = DWM3000.readRXTimestamp(); // Reads T6 (Time Final Arrived)
-    t_roundB = rx - tx; // Calculate Anchor's Round Trip: (Time Final Arrived - Time Response Sent)
-    DWM3000.ds_sendRTInfo(t_roundB, t_replyB);  // Sends DATA packet containing these two integers
+  case 3:                                      // Second response received. Sending information frame
+    rx = DWM3000.readRXTimestamp();            // Reads T6 (Time Final Arrived)
+    t_roundB = rx - tx;                        // Calculate Anchor's Round Trip: (Time Final Arrived - Time Response Sent)
+    DWM3000.ds_sendRTInfo(t_roundB, t_replyB); // Sends DATA packet containing these two integers
 
-    curr_stage = 0; // Reset for next ranging
+    enterStage(0); // Reset for next ranging
     DWM3000.standardRX();
     break;
 
@@ -1906,7 +1927,7 @@ void loop()
     Serial.print(curr_stage);
     Serial.println("). Reverting back to stage 0");
 
-    curr_stage = 0;
+    enterStage(0);
     DWM3000.standardRX();
     break;
   }
