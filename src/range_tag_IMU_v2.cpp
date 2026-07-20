@@ -28,7 +28,11 @@ IPAddress agent_ip(192, 168, 12, 1);
 const uint16_t agent_port = 8888;
 rcl_publisher_t publisher;
 rcl_publisher_t imu_publisher;
+rcl_publisher_t nlos_publisher;
+rcl_publisher_t anchor_age_publisher;
 std_msgs__msg__Float32MultiArray distances_msg;
+std_msgs__msg__Float32MultiArray nlos_msg;
+std_msgs__msg__Float32MultiArray anchor_age_msg;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
@@ -40,9 +44,59 @@ rclc_executor_t executor;
 #define TAG_ID 10
 #define FIRST_ANCHOR_ID 1
 float distances[NUM_ANCHORS] = {0.0};
+float nlos_flags[NUM_ANCHORS] = {0.0}; // 0.0 = LOS, 1.0 = NLOS, per anchor
+// Milliseconds since each anchor's last successful ranging round. A round
+// that times out (see case 2/3 timeout handling) does not update this, so a
+// growing age here means filtered_distance/distances[i] is stale even though
+// it keeps getting republished at PUBLISH_RATE_MS.
+float anchor_age_ms[NUM_ANCHORS] = {0.0};
 #define FILTER_SIZE 5
 #define MIN_DISTANCE 1.0
 #define MAX_DISTANCE 1000.0
+
+// CIR-based NLOS detection. Expected LOS diff (total signal power minus
+// first-path power) rises roughly linearly with distance — fit from empirical
+// LOS baseline logs at 2-5m (see src/analyze_nlos_logs.py). A ranging round is
+// flagged NLOS when the measured diff exceeds that expected value by more
+// than NLOS_MARGIN_DB. Only catches near-field/body-scale obstruction; thin
+// wall attenuation did not separate from LOS in calibration data.
+#define NLOS_BASELINE_INTERCEPT_DB 6.2f
+#define NLOS_BASELINE_SLOPE_DB_PER_M 0.98f
+#define NLOS_MARGIN_DB 3.0f
+
+bool classifyNLOS(float diff_db, float distance_cm)
+{
+  float expected_db = NLOS_BASELINE_INTERCEPT_DB + NLOS_BASELINE_SLOPE_DB_PER_M * (distance_cm / 100.0f);
+  return (diff_db - expected_db) > NLOS_MARGIN_DB;
+}
+
+// Rejects a raw per-anchor distance reading that changed more than
+// physically plausible since the last accepted reading for that anchor,
+// given how much time actually elapsed (scaled by MAX_ANCHOR_SPEED_CM_S, not
+// a fixed cm threshold, so a long gap after a timeout doesn't get falsely
+// flagged as an impossible jump). MIN_JUMP_GATE_CM is slack for normal
+// ranging jitter at short elapsed times.
+#define MAX_ANCHOR_SPEED_CM_S 500.0f // ~5 m/s max plausible relative speed
+#define MIN_JUMP_GATE_CM 30.0f
+// Force-accept after this many consecutive rejections, so a genuine change
+// (anchor moved, tag carried away fast) doesn't get stuck forever. Kept high
+// on purpose: a low value lets a chronically noisy anchor force-accept a bad
+// reading as its new baseline every few rounds, causing the accepted value
+// to slowly drift away from truth even while stationary (observed on a
+// noisy anchor with only 3 rejects). A higher count means noise bursts stay
+// rejected instead of becoming the next comparison point.
+#define MAX_JUMP_REJECTS 10
+
+bool isPlausibleJump(float new_distance, float last_distance, unsigned long elapsed_ms)
+{
+  if (last_distance <= 0.0f)
+  {
+    return true; // no prior reading to compare against
+  }
+  float elapsed_s = elapsed_ms / 1000.0f;
+  float max_change = MAX_ANCHOR_SPEED_CM_S * elapsed_s + MIN_JUMP_GATE_CM;
+  return fabs(new_distance - last_distance) <= max_change;
+}
 #define STAGE_TIMEOUT_MS 100
 
 // Set to 1 to log every Poll / TX timestamp / "Received" line.
@@ -159,6 +213,9 @@ struct AnchorData
   float filtered_distance = 0;
   float signal_strength = 0;
   float fp_signal_strength = 0;
+  bool is_nlos = false;
+  unsigned long last_success_ms = 0;
+  int consec_rejects = 0;
 };
 AnchorData anchors[NUM_ANCHORS];
 void initializeAnchors()
@@ -459,6 +516,26 @@ void publishDistances() {
     rcl_ret_t pub_ret = rcl_publish(&publisher, &distances_msg, NULL);
     if (pub_ret != RCL_RET_OK) {
         Serial.print("[ERROR] Publish failed: ");
+        Serial.println(pub_ret);
+    }
+}
+
+// Publishes the per-anchor NLOS flags (0.0 = LOS, 1.0 = NLOS) computed in
+// case 4 of the ranging state machine. See classifyNLOS().
+void publishNLOS() {
+    rcl_ret_t pub_ret = rcl_publish(&nlos_publisher, &nlos_msg, NULL);
+    if (pub_ret != RCL_RET_OK) {
+        Serial.print("[ERROR] NLOS publish failed: ");
+        Serial.println(pub_ret);
+    }
+}
+
+// Publishes milliseconds since each anchor's last successful ranging round,
+// so subscribers can tell a stale (timed-out) reading from a fresh one.
+void publishAnchorAge() {
+    rcl_ret_t pub_ret = rcl_publish(&anchor_age_publisher, &anchor_age_msg, NULL);
+    if (pub_ret != RCL_RET_OK) {
+        Serial.print("[ERROR] Anchor age publish failed: ");
         Serial.println(pub_ret);
     }
 }
@@ -1271,11 +1348,16 @@ void publishTask(void *pvParameters) {
     if (now - local_last_dist >= PUBLISH_RATE_MS) {
       local_last_dist = now;
       if (xSemaphoreTake(anchor_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        for (int i = 0; i < NUM_ANCHORS; i++)
+        for (int i = 0; i < NUM_ANCHORS; i++) {
           distances[i] = anchors[i].filtered_distance;
+          nlos_flags[i] = anchors[i].is_nlos ? 1.0f : 0.0f;
+          anchor_age_ms[i] = (float)(now - anchors[i].last_success_ms);
+        }
         xSemaphoreGive(anchor_mutex);
       }
       publishDistances();
+      publishNLOS();
+      publishAnchorAge();
       printAllDistances();
     }
     if (now - local_last_imu >= IMU_PUBLISH_RATE_MS) {
@@ -1285,7 +1367,11 @@ void publishTask(void *pvParameters) {
       int64_t stamp_ms = rmw_uros_epoch_millis();
       if (stamp_ms <= 0) stamp_ms = (int64_t)millis();
       fillImuMessage(a, g, stamp_ms);
-      rcl_publish(&imu_publisher, &imu_msg, NULL);
+      rcl_ret_t imu_pub_ret = rcl_publish(&imu_publisher, &imu_msg, NULL);
+      if (imu_pub_ret != RCL_RET_OK) {
+        Serial.print("[ERROR] IMU publish failed: ");
+        Serial.println(imu_pub_ret);
+      }
     }
     vTaskDelay(1);
   }
@@ -1380,6 +1466,30 @@ void setup()
   distances_msg.data.capacity = NUM_ANCHORS;
   distances_msg.data.size = NUM_ANCHORS;
   distances_msg.data.data = distances;
+
+  ret = rclc_publisher_init_default(
+      &nlos_publisher,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+      "/uwb/nlos");
+  Serial.print(" nlos_publisher → ");
+  Serial.println(ret == RCL_RET_OK ? "OK ✓" : "FAILED");
+  std_msgs__msg__Float32MultiArray__init(&nlos_msg);
+  nlos_msg.data.capacity = NUM_ANCHORS;
+  nlos_msg.data.size = NUM_ANCHORS;
+  nlos_msg.data.data = nlos_flags;
+
+  ret = rclc_publisher_init_default(
+      &anchor_age_publisher,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+      "/uwb/anchor_age");
+  Serial.print(" anchor_age_publisher → ");
+  Serial.println(ret == RCL_RET_OK ? "OK ✓" : "FAILED");
+  std_msgs__msg__Float32MultiArray__init(&anchor_age_msg);
+  anchor_age_msg.data.capacity = NUM_ANCHORS;
+  anchor_age_msg.data.size = NUM_ANCHORS;
+  anchor_age_msg.data.data = anchor_age_ms;
 
   ret = rclc_publisher_init_default(
       &imu_publisher,
@@ -1619,12 +1729,31 @@ void loop()
         DWM3000.read(0x12, 0x04),
         DWM3000.read(0x12, 0x08),
         currentAnchor->clock_offset);
-    currentAnchor->distance = DWM3000.convertToCM(ranging_time);
-    currentAnchor->signal_strength = DWM3000.getSignalStrength();
-    currentAnchor->fp_signal_strength = DWM3000.getFirstPathSignalStrength();
-    if (xSemaphoreTake(anchor_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-      updateFilteredDistance(*currentAnchor);
-      xSemaphoreGive(anchor_mutex);
+    float raw_distance = DWM3000.convertToCM(ranging_time);
+    unsigned long elapsed_ms = millis() - currentAnchor->last_success_ms;
+    bool plausible = isPlausibleJump(raw_distance, currentAnchor->distance, elapsed_ms)
+                      || currentAnchor->consec_rejects >= MAX_JUMP_REJECTS;
+
+    if (plausible) {
+      currentAnchor->consec_rejects = 0;
+      currentAnchor->distance = raw_distance;
+      currentAnchor->signal_strength = DWM3000.getSignalStrength();
+      currentAnchor->fp_signal_strength = DWM3000.getFirstPathSignalStrength();
+      currentAnchor->is_nlos = classifyNLOS(
+          currentAnchor->signal_strength - currentAnchor->fp_signal_strength,
+          currentAnchor->distance);
+      currentAnchor->last_success_ms = millis();
+      if (xSemaphoreTake(anchor_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+        updateFilteredDistance(*currentAnchor);
+        xSemaphoreGive(anchor_mutex);
+      }
+    } else {
+      currentAnchor->consec_rejects++;
+      Serial.print("[WARNING] Rejected implausible jump on Anchor ");
+      Serial.print(currentAnchor->anchor_id);
+      Serial.print(": ");
+      Serial.print(raw_distance);
+      Serial.println(" cm");
     }
   }
     anchor_consec_fails[current_anchor_index] = 0;

@@ -4,8 +4,15 @@
 #define RST_PIN 27
 #define CHIP_SELECT_PIN 4
 
-// Set to 1 for Anchor 1, 2 for Anchor 2
+// ANCHOR_ID and ANTENNA_DELAY_INIT are supplied per physical anchor via
+// build_flags in platformio.ini (env:anchor1/anchor2/anchor3) — the #ifndef
+// fallbacks below only apply if built without one of those environments.
+#ifndef ANCHOR_ID
 #define ANCHOR_ID 1
+#endif
+#ifndef ANTENNA_DELAY_INIT
+#define ANTENNA_DELAY_INIT 16360
+#endif
 #define RESPONSE_TIMEOUT_MS 300 // Maximum time to wait for a response
 
 static unsigned long stage_entered_at = 0;
@@ -124,7 +131,7 @@ static long long tx = 0;
 #define NO_OFFSET 0x0
 
 #define DEBUG_OUTPUT 0 // Turn to 1 to get all reads, writes, etc. as info in the console
-static int ANTENNA_DELAY = 16360;
+static int ANTENNA_DELAY = ANTENNA_DELAY_INIT;
 
 int led_status = 0;
 
