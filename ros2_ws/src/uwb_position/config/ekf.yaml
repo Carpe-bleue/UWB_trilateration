@@ -1,0 +1,75 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 10.0           # Match closer to UWB rate (~5-10 Hz) instead of racing ahead at 30 Hz
+    sensor_timeout: 0.5
+    two_d_mode: true         # Locks z, roll, pitch — good for ground robot
+    print_diagnostics: true
+    debug: false             # Set true only when actively debugging — very verbose
+
+    map_frame:       map
+    odom_frame:      odom
+    base_link_frame: base_link
+    world_frame:     odom    # Use odom (not map) when you have no map source
+
+    publish_tf: true         # Publish odom → base_link transform
+
+    # -----------------------------------------------------------------------
+    # UWB odometry input
+    # differential: FALSE — UWB gives absolute positions, not deltas.
+    # Using true here is the PRIMARY cause of NaN in your filtered output.
+    # Config vector: [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az]
+    # -----------------------------------------------------------------------
+    odom0: /uwb/odom
+    odom0_config: [true,  true,  false,
+                   false, false, false,
+                   true,  true,  false,
+                   false, false, false,
+                   false, false, false]
+    odom0_differential: false    # MUST be false for absolute UWB positions
+    odom0_relative: false
+    odom0_queue_size: 20
+    odom0_pose_rejection_threshold: 5.0   # Reject measurements > 5 std-devs from prediction
+
+    # -----------------------------------------------------------------------
+    # IMU input
+    # We fuse yaw rate (angular z velocity) and linear accelerations.
+    # Set imu0 to your actual IMU topic — common values:
+    #   /imu/data       (robot_localization or imu_filter_madgwick output)
+    #   /imu            (raw IMU)
+    # Adjust odom0_config row 6+ if your IMU also publishes orientation.
+    # -----------------------------------------------------------------------
+    imu0: /imu/data
+    # Fuse yaw rate only — orientation_covariance[0] = -1.0 on this IMU means
+    # orientation itself is invalid (REP-103), so we don't fuse roll/pitch/yaw
+    # directly, only the angular velocity around z (yaw rate), which is real.
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,    # yaw rate (angular z)
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 20
+    imu0_remove_gravitational_acceleration: false
+
+    # -----------------------------------------------------------------------
+    # Initial covariance.
+    # CRITICAL: robot_localization's internal state is 15-dimensional
+    # (x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az),
+    # so this matrix MUST be 15x15 (225 values), not 6x6 (36 values).
+    # Supplying only 36 values was the actual root cause of the NaN: it left
+    # velocity/acceleration diagonal entries effectively zero/undefined,
+    # producing a singular matrix on the very first Kalman gain computation
+    # — before any sensor data is even processed.
+    # -----------------------------------------------------------------------
+    initial_estimate_covariance: [1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9]
+
+    # -----------------------------------------------------------------------
+    # Process noise covariance — also MUST be 15x15 (225 values).
+    # State order: x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az
+    # Unobserved states (z, roll, pitch, yaw, and all unfused velocity/accel)
+    # are kept near-zero so they don't grow unconstrained.
+    # x, y position (rows 0,1) and vx, vy velocity (rows 6,7) get real noise
+    # since those are actively fused from UWB.
+    # -----------------------------------------------------------------------
+    process_noise_covariance: [0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-6]

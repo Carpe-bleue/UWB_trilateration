@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# ros2_ws (colcon workspace) — only src/ is real source
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+ros2_ws/**/__pycache__/
+ros2_ws/**/*.egg-info/
+ros2_ws/robot_localization_debug.txt
